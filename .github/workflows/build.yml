@@ -1,4 +1,4 @@
-name: Cache
+name: Build
 
 on:
   push:
@@ -18,3 +18,10 @@ jobs:
 
       - name: Build
         run: cargo build --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffscreencast
+          path: target/release/ffscreencast.exe
+          retention-days: 5

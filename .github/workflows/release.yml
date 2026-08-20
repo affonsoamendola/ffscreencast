@@ -8,23 +8,25 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    runs-on: windows-latest
+  release:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - name: Wait for master build
+        uses: lewagon/wait-on-check-action@v1.3.4
         with:
-          cache-all-crates: "true"
+          ref: master
+          check-name: build
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 10
 
-      - name: Build
-        run: cargo build --release
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ffscreencast
+          path: .
 
       - name: Get version from tag
         id: version
-        shell: bash
         run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
       - name: Create release
@@ -32,5 +34,5 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
-          files: target/release/ffscreencast.exe
+          files: ffscreencast.exe
           generate_release_notes: true
