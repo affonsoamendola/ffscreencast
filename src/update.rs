@@ -91,21 +91,36 @@ fn spawn_updater_and_exit(current_exe: &std::path::Path, new_exe: &std::path::Pa
     let pid = std::process::id();
     let current = current_exe.to_string_lossy().to_string();
     let new = new_exe.to_string_lossy().to_string();
-    let backup = format!("{}.old", current);
 
+    // Write a .ps1 script file — avoids all quoting issues with inline commands
+    let ps1 = std::env::temp_dir().join("ffscreencast_update.ps1");
     let script = format!(
-        "while (Get-Process -Id {} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 500 }}; \
-         Remove-Item '{}' -Force -ErrorAction SilentlyContinue; \
-         Rename-Item '{}' '{}' -Force; \
-         Remove-Item '{}' -Force -ErrorAction SilentlyContinue; \
-         Start-Process '{}';",
-        pid, backup, new, current, backup, current
+        "while (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 500 }}\n\
+         Start-Sleep -Milliseconds 500\n\
+         Rename-Item '{cur}' '{cur}.old' -Force -ErrorAction SilentlyContinue\n\
+         Move-Item -Path '{new}' -Destination '{cur}' -Force\n\
+         Remove-Item '{cur}.old' -Force -ErrorAction SilentlyContinue\n\
+         Remove-Item '{ps1}' -Force -ErrorAction SilentlyContinue\n\
+         Start-Process '{cur}'",
+        pid = pid,
+        cur = current,
+        new = new,
+        ps1 = ps1.display(),
     );
+
+    let _ = std::fs::write(&ps1, script);
 
     logln!("[update] spawning updater and exiting");
 
     let _ = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            &ps1.to_string_lossy(),
+        ])
         .creation_flags(0x00000008) // DETACHED_PROCESS
         .spawn();
 
@@ -113,6 +128,12 @@ fn spawn_updater_and_exit(current_exe: &std::path::Path, new_exe: &std::path::Pa
 }
 
 pub fn check_and_update() {
+    // Clean up leftover .old file from a previous update
+    if let Ok(exe) = std::env::current_exe() {
+        let old = exe.with_extension("exe.old");
+        let _ = std::fs::remove_file(old);
+    }
+
     match check_github() {
         Ok(Some(release)) => {
             let temp_dir = std::env::temp_dir();
