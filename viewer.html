@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ffscreencast</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    margin: 0; background: #0b0d10; color: #e6e8eb;
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px;
+    padding: 10px 16px; border-bottom: 1px solid #1e242c; background: #11151a;
+  }
+  h1 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: .02em; }
+  #status { margin-left: auto; font-variant-numeric: tabular-nums; color: #8b95a1; }
+  #status.live { color: #4ade80; }
+  #status.error { color: #f87171; }
+  main { flex: 1; min-height: 0; overflow: hidden; position: relative; }
+  video {
+    width: 100%; height: 100%; object-fit: contain; background: #000;
+    border-radius: 8px; border: 1px solid #1e242c; display: block;
+    cursor: pointer;
+  }
+  video:-webkit-full-screen { border-radius: 0; border: none; }
+  #muteBtn {
+    margin-left: 10px; background: none; border: 1px solid #1e242c; border-radius: 4px;
+    color: #e6e8eb; font-size: 14px; cursor: pointer; padding: 2px 8px; line-height: 1.4;
+  }
+  #muteBtn:hover { background: #1e242c; }
+  #stats-overlay {
+    display: none; position: absolute; top: 28px; right: 24px; z-index: 10;
+    background: rgba(0,0,0,.75); color: #c8ccd2; font: 12px/1.6 ui-monospace, "Cascadia Code", "Fira Code", monospace;
+    padding: 6px 10px; border-radius: 6px; pointer-events: none;
+    font-variant-numeric: tabular-nums; white-space: pre;
+  }
+
+  /* Login screen */
+  #login-overlay {
+    position: fixed; inset: 0; z-index: 100;
+    background: #0b0d10; display: flex; align-items: center; justify-content: center;
+  }
+  #login-overlay.hidden { display: none; }
+  #login-box {
+    background: #11151a; border: 1px solid #1e242c; border-radius: 12px;
+    padding: 32px; width: 340px; text-align: center;
+  }
+  #login-box h2 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
+  #login-box p { margin: 0 0 20px; font-size: 13px; color: #8b95a1; }
+  #login-box input[type="password"] {
+    width: 100%; padding: 10px 12px; font-size: 14px;
+    background: #0b0d10; color: #e6e8eb; border: 1px solid #1e242c;
+    border-radius: 6px; outline: none; margin-bottom: 12px;
+  }
+  #login-box input[type="password"]:focus { border-color: #4ade80; }
+  #login-box button {
+    width: 100%; padding: 10px; font-size: 14px; font-weight: 600;
+    background: #4ade80; color: #0b0d10; border: none; border-radius: 6px;
+    cursor: pointer;
+  }
+  #login-box button:hover { background: #22c55e; }
+  #login-box button:disabled { background: #1e242c; color: #8b95a1; cursor: default; }
+  #login-error {
+    color: #f87171; font-size: 13px; margin-top: 8px; min-height: 20px;
+  }
+  #login-warning {
+    display: none; margin-top: 12px; padding: 8px 12px;
+    background: rgba(251, 191, 36, 0.1); border: 1px solid #fbbf24;
+    border-radius: 6px; color: #fbbf24; font-size: 12px;
+  }
+</style>
+</head>
+<body>
+  <div id="login-overlay">
+    <div id="login-box">
+      <h2>ffscreencast</h2>
+      <p>Enter the password to view the stream</p>
+      <input type="password" id="pw-input" placeholder="Password" autofocus>
+      <button id="pw-submit">Connect</button>
+      <div id="login-error"></div>
+      <div id="login-warning">Too many failed attempts. Your access has been temporarily blocked.</div>
+    </div>
+  </div>
+
+  <header>
+    <h1>ffscreencast</h1>
+    <span id="status">idle</span>
+    <button id="muteBtn" title="Toggle mute">&#x1f50a;</button>
+  </header>
+  <main>
+    <video id="video" autoplay playsinline></video>
+    <div id="stats-overlay"></div>
+  </main>
+
+<script>
+const statusEl = document.getElementById('status');
+const video    = document.getElementById('video');
+const muteBtn  = document.getElementById('muteBtn');
+const loginOverlay = document.getElementById('login-overlay');
+const pwInput  = document.getElementById('pw-input');
+const pwSubmit = document.getElementById('pw-submit');
+const loginError = document.getElementById('login-error');
+const loginWarning = document.getElementById('login-warning');
+
+let pc = null;
+let reconnectTimer = null;
+let connectionCount = 0;
+let authToken = null;
+let failCount = 0;
+let blocked = false;
+let candidatePollTimer = null;
+
+function setStatus(text, cls = '') {
+  statusEl.textContent = text + (connectionCount > 0 ? ' \u00b7 ' + connectionCount : '');
+  statusEl.className = cls;
+}
+
+// ── Login ────────────────────────────────────────────────────
+
+pwSubmit.addEventListener('click', doLogin);
+pwInput.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+async function doLogin() {
+  if (blocked) return;
+  const pw = pwInput.value;
+  if (!pw) return;
+
+  pwSubmit.disabled = true;
+  loginError.textContent = '';
+
+  try {
+    const res = await fetch('/api/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      authToken = data.token;
+      loginOverlay.classList.add('hidden');
+      connect();
+    } else if (res.status === 403) {
+      failCount++;
+      if (failCount >= 3) {
+        loginWarning.style.display = 'block';
+      }
+      loginError.textContent = 'Wrong password';
+      pwInput.value = '';
+      pwInput.focus();
+    } else if (res.status === 429) {
+      blocked = true;
+      loginWarning.style.display = 'block';
+      loginError.textContent = 'Server blocked access';
+    } else {
+      loginError.textContent = 'Server error (' + res.status + ')';
+    }
+  } catch (err) {
+    loginError.textContent = 'Connection failed';
+  }
+  pwSubmit.disabled = false;
+}
+
+// ── WebRTC ───────────────────────────────────────────────────
+
+function cleanup() {
+  if (candidatePollTimer) { clearInterval(candidatePollTimer); candidatePollTimer = null; }
+  if (pc) { pc.close(); pc = null; }
+  video.srcObject = null;
+}
+
+async function trickleCandidate(candidate) {
+  try {
+    await fetch('/api/candidate', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + authToken
+      },
+      body: JSON.stringify({ candidate })
+    });
+  } catch (_) {}
+}
+
+function pollServerCandidates() {
+  if (candidatePollTimer) return;
+  candidatePollTimer = setInterval(async () => {
+    if (!pc || pc.connectionState === 'connected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      clearInterval(candidatePollTimer);
+      candidatePollTimer = null;
+      return;
+    }
+    try {
+      const res = await fetch('/api/candidates', {
+        headers: { 'Authorization': 'Bearer ' + authToken }
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      for (const c of data.candidates) {
+        try { await pc.addIceCandidate(c); } catch (_) {}
+      }
+    } catch (_) {}
+  }, 500);
+}
+
+async function connect() {
+  setStatus('connecting...');
+
+  pc = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+  });
+
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+
+  pc.addEventListener('icecandidate', evt => {
+    if (evt.candidate) {
+      const c = evt.candidate;
+      if (c.type !== 'host') {
+        console.log(`[webrtc] client ICE candidate: ${c.type} ${c.address}:${c.port} related=${c.relatedAddress}:${c.relatedPort}`);
+      }
+      trickleCandidate(evt.candidate.toJSON());
+    } else {
+      console.log('[webrtc] client ICE gathering complete (end-of-candidates)');
+    }
+  });
+
+  pc.addEventListener('iceconnectionstatechange', () => {
+    console.log('[webrtc] client ICE connection state:', pc.iceConnectionState);
+  });
+
+  pc.addEventListener('track', evt => {
+    if (evt.track.kind === 'video') {
+      video.srcObject = evt.streams[0];
+    } else if (evt.track.kind === 'audio') {
+      if (video.srcObject) {
+        video.srcObject.addTrack(evt.track);
+      } else {
+        video.srcObject = evt.streams[0];
+      }
+    }
+  });
+
+  pc.addEventListener('connectionstatechange', () => {
+    const s = pc.connectionState;
+    if (s === 'connected') {
+      connectionCount++;
+      setStatus('live', 'live');
+      fetch('/api/keyframe', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + authToken }
+      }).catch(() => {});
+    } else if (s === 'failed' || s === 'closed') {
+      setStatus(s, 'error');
+      cleanup();
+      scheduleReconnect();
+    } else {
+      setStatus(s);
+    }
+  });
+
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    const res = await fetch('/offer', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + authToken
+      },
+      body: JSON.stringify({
+        sdp:  pc.localDescription.sdp,
+        type: pc.localDescription.type
+      })
+    });
+    if (!res.ok) throw new Error('server returned ' + res.status);
+    await pc.setRemoteDescription(await res.json());
+    pollServerCandidates();
+  } catch (err) {
+    setStatus(err.message, 'error');
+    cleanup();
+    scheduleReconnect();
+  }
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, 2000);
+}
+
+window.addEventListener('beforeunload', () => {
+  if (pc) { pc.close(); pc = null; }
+});
+
+video.addEventListener('dblclick', () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else video.requestFullscreen();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'f' || e.key === 'F') {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else video.requestFullscreen();
+  }
+  if (e.key === 'm' || e.key === 'M') {
+    video.muted = !video.muted;
+    muteBtn.textContent = video.muted ? '\ud83d\udd07' : '\ud83d\udd0a';
+  }
+  if (e.key === 's' || e.key === 'S') {
+    toggleStats();
+  }
+});
+muteBtn.addEventListener('click', () => {
+  video.muted = !video.muted;
+  muteBtn.textContent = video.muted ? '\ud83d\udd07' : '\ud83d\udd0a';
+});
+
+const statsOverlay = document.getElementById('stats-overlay');
+let statsVisible = false;
+let statsTimer = null;
+let prevDecoded = 0;
+let prevBytes = 0;
+let prevTime = 0;
+
+function updateStats() {
+  if (!pc || pc.connectionState !== 'connected') return;
+  pc.getStats().then(report => {
+    let inbound = null;
+    report.forEach(s => { if (s.type === 'inbound-rtp' && s.kind === 'video') inbound = s; });
+    if (!inbound) return;
+
+    const now = performance.now() / 1000;
+    const dt = prevTime ? now - prevTime : 1;
+    prevTime = now;
+
+    const fps = prevDecoded ? ((inbound.framesDecoded - prevDecoded) / dt).toFixed(1) : '--';
+    prevDecoded = inbound.framesDecoded;
+
+    const bitrate = prevBytes ? (((inbound.bytesReceived - prevBytes) * 8 / dt) / 1_000_000).toFixed(2) : '--';
+    prevBytes = inbound.bytesReceived;
+
+    const rtt = inbound.roundTripTime != null ? (inbound.roundTripTime * 1000).toFixed(1) + ' ms' : '--';
+    const jitter = inbound.jitter != null ? (inbound.jitter * 1000).toFixed(2) + ' ms' : '--';
+    const lost = inbound.packetsLost || 0;
+    const recv = inbound.packetsReceived || 0;
+    const lossPct = recv ? ((lost / (lost + recv)) * 100).toFixed(2) + '%' : '0%';
+    const freezes = inbound.freezeCount || 0;
+    const w = inbound.frameWidth || '?';
+    const h = inbound.frameHeight || '?';
+
+    statsOverlay.textContent =
+      `FPS      ${fps}\n` +
+      `Res      ${w}x${h}\n` +
+      `Bitrate  ${bitrate} Mbps\n` +
+      `RTT      ${rtt}\n` +
+      `Jitter   ${jitter}\n` +
+      `Lost     ${lossPct} (${lost})\n` +
+      `Freezes  ${freezes}`;
+  });
+}
+
+function toggleStats() {
+  statsVisible = !statsVisible;
+  statsOverlay.style.display = statsVisible ? 'block' : 'none';
+  if (statsVisible && !statsTimer) {
+    updateStats();
+    statsTimer = setInterval(updateStats, 1000);
+  } else if (!statsVisible && statsTimer) {
+    clearInterval(statsTimer);
+    statsTimer = null;
+  }
+}
+</script>
+</body>
+</html>

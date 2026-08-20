@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+*.spec.bak
+*.exe
+*.log
+*.log[0-9]
+
+# Added by cargo
+
+/target
