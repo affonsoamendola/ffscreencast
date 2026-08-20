@@ -19,10 +19,12 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           wait-interval: 10
 
-      - name: Download artifact
-        uses: actions/download-artifact@v4
+      - name: Download artifact from master build
+        uses: dawidd6/action-download-artifact@v6
         with:
-          name: ffscreencast
+          workflow: build.yml
+          branch: master
+          name: ffscreencast-exe
           path: .
 
       - name: Get version from tag
