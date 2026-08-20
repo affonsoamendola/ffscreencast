@@ -1,5 +1,12 @@
 //! Auto-update system: checks GitHub Releases for new versions,
 //! downloads the update, replaces the binary, and restarts.
+//!
+//! Update flow:
+//! 1. App downloads new exe as `ffscreencast.new.exe` next to itself
+//! 2. App spawns `ffscreencast.new.exe` as a detached process
+//! 3. App exits
+//! 4. `ffscreencast.new.exe` sees its name ends with `.new.exe`, enters update mode
+//! 5. It waits for the old process to exit, deletes the old exe, renames itself, restarts
 
 use anyhow::{Context, Result};
 use semver::Version;
@@ -7,9 +14,67 @@ use std::os::windows::process::CommandExt;
 
 const GITHUB_REPO: &str = "affonsoamendola/ffscreencast";
 const EXE_NAME: &str = "ffscreencast.exe";
+const EXE_NEW: &str = "ffscreencast.new.exe";
 
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// Called at startup. If we are `ffscreencast.new.exe`, perform the update and restart.
+pub fn handle_update_mode() -> bool {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    let name = exe.file_name().unwrap_or_default().to_string_lossy();
+
+    if !name.eq_ignore_ascii_case(EXE_NEW) {
+        return false;
+    }
+
+    logln!("[update] running as {}, entering update mode", EXE_NEW);
+
+    let dir = exe.parent().unwrap_or(std::path::Path::new("."));
+    let target = dir.join(EXE_NAME);
+
+    // Wait for the old process to exit
+    loop {
+        let is_running = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("IMAGENAME eq {}", EXE_NAME)])
+            .output()
+            .map(|o| {
+                let out = String::from_utf8_lossy(&o.stdout);
+                out.lines()
+                    .any(|l| l.contains(EXE_NAME) && !l.contains("ffscreencast.new"))
+            })
+            .unwrap_or(false);
+
+        if !is_running {
+            break;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // Small delay for OS to release file handles
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Delete the old exe
+    let _ = std::fs::remove_file(&target);
+
+    // Rename ourselves to the target name
+    match std::fs::rename(&exe, &target) {
+        Ok(_) => {
+            logln!("[update] renamed self to {}", target.display());
+            // Launch the real app
+            let _ = std::process::Command::new(&target).spawn();
+        }
+        Err(e) => {
+            logln!("[update] rename failed: {e}");
+        }
+    }
+
+    true
 }
 
 struct Release {
@@ -87,40 +152,10 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn spawn_updater_and_exit(current_exe: &std::path::Path, new_exe: &std::path::Path) {
-    let pid = std::process::id();
-    let current = current_exe.to_string_lossy().to_string();
-    let new = new_exe.to_string_lossy().to_string();
+fn spawn_new_and_exit(new_exe: &std::path::Path) {
+    logln!("[update] spawning new version and exiting");
 
-    // Write a .ps1 script file — avoids all quoting issues with inline commands
-    let ps1 = std::env::temp_dir().join("ffscreencast_update.ps1");
-    let script = format!(
-        "while (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 500 }}\n\
-         Start-Sleep -Milliseconds 500\n\
-         Rename-Item '{cur}' '{cur}.old' -Force -ErrorAction SilentlyContinue\n\
-         Move-Item -Path '{new}' -Destination '{cur}' -Force\n\
-         Remove-Item '{cur}.old' -Force -ErrorAction SilentlyContinue\n\
-         Remove-Item '{ps1}' -Force -ErrorAction SilentlyContinue\n\
-         Start-Process '{cur}'",
-        pid = pid,
-        cur = current,
-        new = new,
-        ps1 = ps1.display(),
-    );
-
-    let _ = std::fs::write(&ps1, script);
-
-    logln!("[update] spawning updater and exiting");
-
-    let _ = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &ps1.to_string_lossy(),
-        ])
+    let _ = std::process::Command::new(new_exe)
         .creation_flags(0x00000008) // DETACHED_PROCESS
         .spawn();
 
@@ -128,27 +163,26 @@ fn spawn_updater_and_exit(current_exe: &std::path::Path, new_exe: &std::path::Pa
 }
 
 pub fn check_and_update() {
-    // Clean up leftover .old file from a previous update
+    // Clean up leftover .new.exe from a previous update
     if let Ok(exe) = std::env::current_exe() {
-        let old = exe.with_extension("exe.old");
-        let _ = std::fs::remove_file(old);
+        let dir = exe.parent().unwrap_or(std::path::Path::new("."));
+        let _ = std::fs::remove_file(dir.join(EXE_NEW));
     }
 
     match check_github() {
         Ok(Some(release)) => {
-            let temp_dir = std::env::temp_dir();
-            let new_exe = temp_dir.join(EXE_NAME);
+            let current_exe = std::env::current_exe().unwrap_or_else(|_| {
+                std::path::PathBuf::from(EXE_NAME)
+            });
+            let dir = current_exe.parent().unwrap_or(std::path::Path::new("."));
+            let new_exe = dir.join(EXE_NEW);
 
             if let Err(e) = download_file(&release.exe_url, &new_exe) {
                 logln!("[update] download failed: {e}");
                 return;
             }
 
-            let current_exe = std::env::current_exe().unwrap_or_else(|_| {
-                std::path::PathBuf::from(EXE_NAME)
-            });
-
-            spawn_updater_and_exit(&current_exe, &new_exe);
+            spawn_new_and_exit(&new_exe);
         }
         Ok(None) => {}
         Err(e) => {

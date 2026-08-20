@@ -25,6 +25,11 @@ use crate::stats::{StreamStats, STATS_DIRTY};
 use crate::tray::TrayCtx;
 
 fn main() -> Result<()> {
+    // If we are the new exe performing an update, handle it and exit
+    if update::handle_update_mode() {
+        return Ok(());
+    }
+
     log::init();
 
     let default_hook = std::panic::take_hook();
